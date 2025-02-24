@@ -23,7 +23,7 @@ async function initBrowser() {
         await page.setDefaultTimeout(30000);
         await page.setDefaultNavigationTimeout(30000);
 
-        return page;
+        return { page, context };
     } catch (error) {
         console.error('Browser initialization error:', error);
         return null;
@@ -32,18 +32,14 @@ async function initBrowser() {
 
 async function extractEmailsFromPage(page) {
     try {
-        // Wait for content to load with safety checks
+        if (!page || page.isClosed()) return null;
+
         await page.waitForLoadState('domcontentloaded').catch(() => {});
         await page.waitForTimeout(2000);
 
-        // Check if page is still valid
-        if (!page || page.isClosed()) {
-            return null;
-        }
-
         const emails = await page.evaluate(() => {
             const results = new Set();
-            const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/gi;
+            const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
             
             function addEmail(email) {
                 if (!email) return;
@@ -53,39 +49,40 @@ async function extractEmailsFromPage(page) {
                     email.includes('@') && 
                     email.includes('.') && 
                     !email.includes('example') &&
-                    !email.includes('test@')) {
+                    !email.includes('test@') &&
+                    !email.includes('email@') &&
+                    !email.includes('your@') &&
+                    !email.includes('sample@') &&
+                    !email.includes('demo@') &&
+                    !email.includes('domain')) {
                     results.add(email);
                 }
             }
 
-            try {
-                // Safely get document content
-                const doc = document.documentElement;
-                if (!doc) return [];
+            // Search in all content
+            const htmlContent = document.documentElement.innerHTML || '';
+            const textContent = document.documentElement.textContent || '';
 
-                // Search in HTML content
-                const htmlContent = doc.outerHTML || '';
-                const htmlEmails = htmlContent.match(emailRegex) || [];
-                htmlEmails.forEach(addEmail);
+            // Extract from HTML and text
+            [htmlContent, textContent].forEach(content => {
+                const matches = content.match(emailRegex) || [];
+                matches.forEach(addEmail);
+            });
 
-                // Search in text content
-                const textContent = document.body?.innerText || '';
-                const textEmails = textContent.match(emailRegex) || [];
-                textEmails.forEach(addEmail);
+            // Extract from mailto links
+            document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
+                if (link.href) {
+                    const email = link.href.replace('mailto:', '').split('?')[0];
+                    addEmail(email);
+                }
+            });
 
-                // Search in mailto links
-                document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
-                    if (link.href) {
-                        const email = link.href.replace('mailto:', '').split('?')[0];
-                        addEmail(email);
-                    }
-                });
+            // Extract from forms
+            document.querySelectorAll('input[type="email"]').forEach(input => {
+                if (input.value) addEmail(input.value);
+            });
 
-                return Array.from(results);
-            } catch (e) {
-                console.error('Error in page evaluation:', e);
-                return [];
-            }
+            return Array.from(results);
         }).catch(() => []);
 
         return emails.length > 0 ? emails[0] : null;
@@ -107,10 +104,10 @@ async function safeGoTo(page, url) {
         await page.goto(url, {
             timeout: 30000,
             waitUntil: 'domcontentloaded'
-        });
+        }).catch(() => {});
         
-        await page.waitForTimeout(2000);
-        return true;
+        await page.waitForTimeout(2000).catch(() => {});
+        return !page.isClosed();
     } catch (error) {
         console.error(`Navigation error for ${url}:`, error.message);
         return false;
@@ -118,94 +115,76 @@ async function safeGoTo(page, url) {
 }
 
 parentPort.on('message', async (data) => {
+    let browser = null;
     let page = null;
     let context = null;
     
     try {
         const { business, requestId } = data;
+        
         if (!business?.website || business.website === 'N/A') {
-            parentPort.postMessage({ 
-                requestId,
-                error: false, 
-                email: null 
-            });
+            parentPort.postMessage({ requestId, error: false, email: null });
             return;
         }
 
-        page = await initBrowser();
-        if (!page) {
-            parentPort.postMessage({ 
-                requestId,
-                error: true, 
-                email: null 
-            });
+        const result = await initBrowser();
+        if (!result) {
+            parentPort.postMessage({ requestId, error: true, email: null });
             return;
         }
 
-        context = page.context();
+        ({ page, context } = result);
+        browser = context.browser();
         let email = null;
 
-        // Try main page
         if (await safeGoTo(page, business.website)) {
             email = await extractEmailsFromPage(page);
         }
 
-        // If no email found and page is still valid, try contact pages
         if (!email && page && !page.isClosed()) {
             const contactPaths = [
-                'contact',
-                'contact-us',
-                'about',
-                'about-us',
-                'contact.html',
-                'contact-us.html'
+                'contact', 'contact-us', 'about', 'about-us',
+                'contact.html', 'contact-us.html', 'about.html'
             ];
 
             for (const path of contactPaths) {
                 if (email || page.isClosed()) break;
+                
                 const contactUrl = `${business.website.replace(/\/+$/, '')}/${path}`;
                 if (await safeGoTo(page, contactUrl)) {
                     email = await extractEmailsFromPage(page);
                 }
+                
+                if (!page.isClosed()) {
+                    await page.waitForTimeout(1000).catch(() => {});
+                }
             }
         }
 
-        // Send response with requestId
-        parentPort.postMessage({ 
-            requestId,
-            error: false, 
-            email 
-        });
+        if (!page.isClosed()) {
+            parentPort.postMessage({ requestId, error: false, email });
+        }
 
     } catch (error) {
         console.error('Worker error:', error);
-        parentPort.postMessage({ 
-            requestId,
-            error: true, 
-            email: null 
-        });
+        if (data?.requestId) {
+            parentPort.postMessage({ requestId: data.requestId, error: true, email: null });
+        }
     } finally {
         try {
-            if (page && !page.isClosed()) {
-                await page.close().catch(() => {});
-            }
-            if (context) {
-                await context.close().catch(() => {});
-            }
-            if (browser) {
-                await browser.close().catch(() => {});
-                browser = null;
-            }
+            if (page && !page.isClosed()) await page.close().catch(() => {});
+            if (context) await context.close().catch(() => {});
+            if (browser) await browser.close().catch(() => {});
         } catch (error) {
             console.error('Cleanup error:', error);
         }
     }
 });
 
-// Cleanup on exit
 process.on('exit', async () => {
-    if (browser) {
-        await browser.close().catch(() => {});
-        browser = null;
+    try {
+        if (browser) await browser.close().catch(() => {});
+    } catch (error) {
+        console.error('Exit cleanup error:', error);
     }
 });  

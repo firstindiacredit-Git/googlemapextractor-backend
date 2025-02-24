@@ -19,7 +19,7 @@ app.post('/stop-scrape', (req, res) => {
         currentScraping = null;
         res.json({ message: 'Scraping stopped' });
     } else {
-        res.json({ message: 'No active scraping to stop' });   
+        res.json({ message: 'No active scraping to stop' });    
     }
 });
 

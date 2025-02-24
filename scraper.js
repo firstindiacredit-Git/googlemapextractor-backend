@@ -3,8 +3,8 @@ const { Worker } = require('worker_threads');
 const path = require('path');
 const os = require('os');
 
-// Use a fixed number of threads instead
-const NUM_WORKERS = 4; // Always use 4 worker threads
+// Use 2 worker threads for better resource management
+const NUM_WORKERS = 2;
 // console.log(`Using ${NUM_WORKERS} worker threads`);
 const workers = [];
 let currentWorkerIndex = 0;
@@ -29,7 +29,7 @@ async function extractEmailsFromWebsite(page, url) {
     // console.log(`\nStarting email extraction for URL: ${url}`);
     try {
         if (!url || url === 'N/A') {
-            // console.log('Invalid URL provided');
+             //console.log('Invalid URL provided');
             return 'N/A';
         }
 
@@ -41,18 +41,18 @@ async function extractEmailsFromWebsite(page, url) {
         // console.log(`Cleaned URL: ${url}`);
 
         try {
-            // console.log('Navigating to website...');
+             console.log('Navigating to website...');
             await page.goto(url, { 
                 timeout: 60000,
                 waitUntil: 'domcontentloaded'
             });
-            // console.log('Successfully loaded website');
+             console.log('Successfully loaded website');
 
             const emails = await extractEmailsFromPage(page);
             // console.log(`Found ${emails.length} potential emails`);  
             
             if (emails.length > 0) {
-                // console.log(`Emails found: ${emails.join(', ')}`);
+                 console.log(`Emails found: ${emails.join(', ')}`);
                 return emails[0];
             }
             
@@ -121,7 +121,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
     let browser = null;
     let scrapedData = [];
     let isStopped = false;
-    const MAX_CONCURRENT = extractEmail ? 5 : 10; // Reduced concurrent operations for email extraction
+    const MAX_CONCURRENT = extractEmail ? 2 : 4; // Reduce concurrent operations based on email extraction
 
     try {
         // Initialize worker pool if not already initialized
@@ -155,7 +155,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
         let lastResultsCount = 0;
         let consecutiveNoNewResults = 0;
 
-        // Modified processListingsBatch function
+        // Optimize batch processing
         async function processListingsBatch(listings) {
             const results = [];
             const batchSize = Math.min(MAX_CONCURRENT, listings.length);
@@ -164,10 +164,10 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                 if (isStopped) break;
                 
                 const batch = listings.slice(i, i + batchSize);
-                const batchPromises = batch.map(async (listing, index) => {
+                const batchPromises = batch.map(async (listing) => {
                     try {
                         const detailsPage = await context.newPage();
-                        await detailsPage.setDefaultNavigationTimeout(15000);
+                        await detailsPage.setDefaultNavigationTimeout(20000); // Increased timeout
 
                         const href = await listing.getAttribute('href');
                         await detailsPage.goto(href, { waitUntil: 'domcontentloaded' });
@@ -218,7 +218,6 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
 
                         if (extractEmail && business.website !== 'N/A') {
                             try {
-                                // Get a worker and create a unique ID for this request
                                 const worker = getNextWorker();
                                 const requestId = Date.now() + '-' + Math.random();
                                 
@@ -226,9 +225,8 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                                     const timeoutId = setTimeout(() => {
                                         worker.removeListener('message', messageHandler);
                                         resolve({ error: false, email: 'N/A' });
-                                    }, 30000); // 30 second timeout
+                                    }, 45000); // Increased timeout for more thorough email search
 
-                                    // Create message handler that checks for matching requestId
                                     const messageHandler = (data) => {
                                         if (data.requestId === requestId) {
                                             clearTimeout(timeoutId);
@@ -237,14 +235,8 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                                         }
                                     };
 
-                                    // Add message listener
                                     worker.on('message', messageHandler);
-
-                                    // Send message with requestId
-                                    worker.postMessage({ 
-                                        business,
-                                        requestId 
-                                    });
+                                    worker.postMessage({ business, requestId });
                                 });
 
                                 business.email = result.error ? 'N/A' : (result.email || 'N/A');
@@ -257,7 +249,6 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
 
                         await detailsPage.close();
                         return business;
-
                     } catch (error) {
                         console.error(`Error processing business:`, error.message);
                         return null;
@@ -266,6 +257,11 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
 
                 const batchResults = await Promise.all(batchPromises);
                 results.push(...batchResults.filter(r => r !== null));
+                
+                // Add small delay between batches to prevent rate limiting
+                if (!isStopped && i + batchSize < listings.length) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
             return results;
         }
@@ -282,7 +278,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                 await page.waitForTimeout(2000);
 
                 const listings = await page.$$('a[href*="https://www.google.com/maps/place"]');
-                // console.log(`Found ${listings.length} total listings (${lastResultsCount} previous)`);
+                 console.log(`Found ${listings.length} total listings (${lastResultsCount} previous)`);
 
                 if (listings.length > lastResultsCount) {
                     const newListings = listings.slice(lastResultsCount);
@@ -291,7 +287,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                     for (const result of results) {
                         scrapedData.push(result);
                         onDataScraped(result);
-                        // console.log(`✅ Scraped (${scrapedData.length}/${total}): ${result.name}`);
+                         console.log(`✅ Scraped (${scrapedData.length}/${total}): ${result.name}`);
                     }
 
                     lastResultsCount = listings.length; 
