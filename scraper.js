@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 
 // Use 2 worker threads for better resource management
-const NUM_WORKERS = 2;
+const NUM_WORKERS = 1;
 // console.log(`Using ${NUM_WORKERS} worker threads`);
 const workers = [];
 let currentWorkerIndex = 0;
