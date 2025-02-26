@@ -28,38 +28,24 @@ app.post('/scrape', async (req, res) => {
     const { query, total, extractEmail } = req.body;
     
     currentScraping = new AbortController();
+    let dataCount = 0;
 
     try {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Transfer-Encoding', 'chunked');
         
-        let dataCount = 0;
-        
         const results = await scrapeGoogleMaps(
             query, 
             total, 
             (data) => {
-                // Ensure all fields are strings or null
-                const formattedData = {
-                    name: String(data.name || 'N/A'),
-                    email: String(data.email || 'N/A'),
-                    phone: String(data.phone || 'N/A'),
-                    website: String(data.website || 'N/A'),
-                    category: String(data.category || 'N/A'),
-                    rating: String(data.rating || 'N/A'),
-                    reviews: String(data.reviews || '0'),
-                    countryCode: String(data.countryCode || '+91'),
-                    pincode: String(data.pincode || 'N/A'),
-                    city: String(data.city || 'N/A'),
-                    state: String(data.state || 'N/A'),
-                    address: String(data.address || 'N/A')
-                };
-
+                dataCount++;
+                const progress = Math.min((dataCount / total) * 100, 100);
+                
                 if (!res.writableEnded) {
                     res.write(JSON.stringify({ 
                         type: 'update', 
-                        data: formattedData,
-                        progress: ++dataCount
+                        data: data,
+                        progress: progress
                     }) + '\n');
                 }
             }, 

@@ -4,7 +4,7 @@ const path = require('path');
 const os = require('os');
 
 // Use 2 worker threads for better resource management
-const NUM_WORKERS = 1;
+const NUM_WORKERS = 2;
 // console.log(`Using ${NUM_WORKERS} worker threads`);
 const workers = [];
 let currentWorkerIndex = 0;
@@ -121,7 +121,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
     let browser = null;
     let scrapedData = [];
     let isStopped = false;
-    const MAX_CONCURRENT = extractEmail ? 2 : 4; // Reduce concurrent operations based on email extraction
+    const MAX_CONCURRENT = extractEmail ? 2 : 4; // Adjust concurrent operations
 
     try {
         // Initialize worker pool if not already initialized
@@ -225,7 +225,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                                     const timeoutId = setTimeout(() => {
                                         worker.removeListener('message', messageHandler);
                                         resolve({ error: false, email: 'N/A' });
-                                    }, 45000); // Increased timeout for more thorough email search
+                                    }, 15000); // Reduced timeout to 15 seconds
 
                                     const messageHandler = (data) => {
                                         if (data.requestId === requestId) {

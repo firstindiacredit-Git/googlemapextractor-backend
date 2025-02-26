@@ -5,27 +5,36 @@ let browser = null;
 
 async function initBrowser() {
     try {
+        // Close existing browser if it exists
+        if (browser) {
+            await browser.close().catch(() => {});
+            browser = null;
+        }
+
+        // Create new browser instance
         browser = await chromium.launch({
             headless: true,
-            args: [
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox'
-            ]
+            args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-setuid-sandbox']
         });
 
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            viewport: { width: 1280, height: 720 }
+            viewport: { width: 1280, height: 720 },
+            bypassCSP: true,
+            ignoreHTTPSErrors: true
         });
 
         const page = await context.newPage();
-        await page.setDefaultTimeout(30000);
-        await page.setDefaultNavigationTimeout(30000);
+        await page.setDefaultTimeout(15000);
+        await page.setDefaultNavigationTimeout(15000);
 
         return { page, context };
     } catch (error) {
         console.error('Browser initialization error:', error);
+        if (browser) {
+            await browser.close().catch(() => {});
+            browser = null;
+        }
         return null;
     }
 }
@@ -35,55 +44,36 @@ async function extractEmailsFromPage(page) {
         if (!page || page.isClosed()) return null;
 
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1500);
 
         const emails = await page.evaluate(() => {
             const results = new Set();
             const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
             
-            function addEmail(email) {
-                if (!email) return;
-                email = email.toLowerCase().trim();
-                if (email.length > 5 && 
-                    email.length < 100 && 
-                    email.includes('@') && 
-                    email.includes('.') && 
-                    !email.includes('example') &&
-                    !email.includes('test@') &&
-                    !email.includes('email@') &&
-                    !email.includes('your@') &&
-                    !email.includes('sample@') &&
-                    !email.includes('demo@') &&
-                    !email.includes('domain')) {
-                    results.add(email);
-                }
-            }
-
-            // Search in all content
-            const htmlContent = document.documentElement.innerHTML || '';
-            const textContent = document.documentElement.textContent || '';
-
-            // Extract from HTML and text
-            [htmlContent, textContent].forEach(content => {
-                const matches = content.match(emailRegex) || [];
-                matches.forEach(addEmail);
-            });
-
-            // Extract from mailto links
+            // First check mailto links (most reliable)
             document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
                 if (link.href) {
                     const email = link.href.replace('mailto:', '').split('?')[0];
-                    addEmail(email);
+                    if (email) results.add(email.toLowerCase());
                 }
             });
 
-            // Extract from forms
-            document.querySelectorAll('input[type="email"]').forEach(input => {
-                if (input.value) addEmail(input.value);
+            // Then check page content
+            const content = document.body.innerText;
+            const matches = content.match(emailRegex) || [];
+            matches.forEach(email => {
+                email = email.toLowerCase().trim();
+                if (email.length > 5 && 
+                    email.length < 100 && 
+                    !email.includes('example') &&
+                    !email.includes('test@') &&
+                    !email.includes('email@')) {
+                    results.add(email);
+                }
             });
 
             return Array.from(results);
-        }).catch(() => []);
+        });
 
         return emails.length > 0 ? emails[0] : null;
     } catch (error) {
@@ -102,12 +92,12 @@ async function safeGoTo(page, url) {
         }
 
         await page.goto(url, {
-            timeout: 30000,
+            timeout: 15000,
             waitUntil: 'domcontentloaded'
-        }).catch(() => {});
+        });
         
-        await page.waitForTimeout(2000).catch(() => {});
-        return !page.isClosed();
+        await page.waitForTimeout(1500);
+        return true;
     } catch (error) {
         console.error(`Navigation error for ${url}:`, error.message);
         return false;
@@ -115,7 +105,6 @@ async function safeGoTo(page, url) {
 }
 
 parentPort.on('message', async (data) => {
-    let browser = null;
     let page = null;
     let context = null;
     
@@ -123,68 +112,67 @@ parentPort.on('message', async (data) => {
         const { business, requestId } = data;
         
         if (!business?.website || business.website === 'N/A') {
-            parentPort.postMessage({ requestId, error: false, email: null });
+            parentPort.postMessage({ requestId, error: false, email: 'N/A' });
             return;
         }
 
         const result = await initBrowser();
         if (!result) {
-            parentPort.postMessage({ requestId, error: true, email: null });
+            parentPort.postMessage({ requestId, error: true, email: 'N/A' });
             return;
         }
 
         ({ page, context } = result);
-        browser = context.browser();
         let email = null;
 
+        // Try main page
         if (await safeGoTo(page, business.website)) {
             email = await extractEmailsFromPage(page);
         }
 
-        if (!email && page && !page.isClosed()) {
-            const contactPaths = [
-                'contact', 'contact-us', 'about', 'about-us',
-                'contact.html', 'contact-us.html', 'about.html'
-            ];
-
+        // Try contact page if no email found
+        if (!email && !page.isClosed()) {
+            const contactPaths = ['contact', 'contact-us', 'about'];
+            
             for (const path of contactPaths) {
-                if (email || page.isClosed()) break;
+                if (email) break;
                 
                 const contactUrl = `${business.website.replace(/\/+$/, '')}/${path}`;
                 if (await safeGoTo(page, contactUrl)) {
                     email = await extractEmailsFromPage(page);
                 }
-                
-                if (!page.isClosed()) {
-                    await page.waitForTimeout(1000).catch(() => {});
-                }
             }
         }
 
-        if (!page.isClosed()) {
-            parentPort.postMessage({ requestId, error: false, email });
-        }
+        parentPort.postMessage({ requestId, error: false, email: email || 'N/A' });
 
     } catch (error) {
         console.error('Worker error:', error);
-        if (data?.requestId) {
-            parentPort.postMessage({ requestId: data.requestId, error: true, email: null });
-        }
+        parentPort.postMessage({ requestId: data?.requestId, error: true, email: 'N/A' });
     } finally {
         try {
             if (page && !page.isClosed()) await page.close().catch(() => {});
             if (context) await context.close().catch(() => {});
-            if (browser) await browser.close().catch(() => {});
         } catch (error) {
             console.error('Cleanup error:', error);
         }
     }
 });
 
+// Clean up browser on exit
 process.on('exit', async () => {
+    if (browser) {
+        await browser.close().catch(() => {});
+        browser = null;
+    }
+});
+
+// Handle worker termination
+process.on('SIGTERM', async () => {
     try {
         if (browser) await browser.close().catch(() => {});
+        browser = null;
     } catch (error) {
-        console.error('Exit cleanup error:', error);
+        console.error('SIGTERM cleanup error:', error);
     }
 });  
