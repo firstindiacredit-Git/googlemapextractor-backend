@@ -25,7 +25,7 @@ app.post('/stop-scrape', (req, res) => {
 
 // Endpoint for scraping data
 app.post('/scrape', async (req, res) => {
-    const { query, total, extractEmail } = req.body;
+    const { query, location, isPincode, total, extractEmail } = req.body;
     
     currentScraping = new AbortController();
     let dataCount = 0;
@@ -34,21 +34,43 @@ app.post('/scrape', async (req, res) => {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Transfer-Encoding', 'chunked');
         
+        // Construct search query based on whether location is a pincode
+        const searchQuery = isPincode 
+            ? `${query} ${location}`  // Use pincode directly
+            : `${query} ${location}`; // Use as regular location
+
         const results = await scrapeGoogleMaps(
-            query, 
-            total, 
+            searchQuery,
+            total,
             (data) => {
-                dataCount++;
-                const progress = Math.min((dataCount / total) * 100, 100);
-                
-                if (!res.writableEnded) {
-                    res.write(JSON.stringify({ 
-                        type: 'update', 
-                        data: data,
-                        progress: progress
-                    }) + '\n');
+                // Filter results if searching by pincode
+                if (isPincode) {
+                    if (data.pincode === location.trim()) {
+                        dataCount++;
+                        const progress = Math.min((dataCount / total) * 100, 100);
+                        
+                        if (!res.writableEnded) {
+                            res.write(JSON.stringify({ 
+                                type: 'update', 
+                                data: data,
+                                progress: progress
+                            }) + '\n');
+                        }
+                    }
+                } else {
+                    // Normal processing for non-pincode searches
+                    dataCount++;
+                    const progress = Math.min((dataCount / total) * 100, 100);
+                    
+                    if (!res.writableEnded) {
+                        res.write(JSON.stringify({ 
+                            type: 'update', 
+                            data: data,
+                            progress: progress
+                        }) + '\n');
+                    }
                 }
-            }, 
+            },
             currentScraping.signal,
             extractEmail
         );
@@ -56,7 +78,7 @@ app.post('/scrape', async (req, res) => {
         if (!res.writableEnded) {
             res.write(JSON.stringify({ 
                 type: 'complete', 
-                totalResults: results.length 
+                totalResults: dataCount 
             }));
             res.end();
         }

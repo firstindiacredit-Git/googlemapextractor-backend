@@ -5,71 +5,60 @@ let browser = null;
 
 async function initBrowser() {
     try {
-        // Close existing browser if it exists
+        // Always create a new browser instance for each request
         if (browser) {
             await browser.close().catch(() => {});
-            browser = null;
         }
 
-        // Create new browser instance
         browser = await chromium.launch({
             headless: true,
-            args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-setuid-sandbox']
+            args: [
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox'
+            ]
         });
 
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            viewport: { width: 1280, height: 720 },
-            bypassCSP: true,
-            ignoreHTTPSErrors: true
+            viewport: { width: 1280, height: 720 }
         });
 
         const page = await context.newPage();
-        await page.setDefaultTimeout(15000);
-        await page.setDefaultNavigationTimeout(15000);
-
         return { page, context };
     } catch (error) {
         console.error('Browser initialization error:', error);
-        if (browser) {
-            await browser.close().catch(() => {});
-            browser = null;
-        }
         return null;
     }
 }
 
 async function extractEmailsFromPage(page) {
     try {
-        if (!page || page.isClosed()) return null;
-
         await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(2000);
 
         const emails = await page.evaluate(() => {
             const results = new Set();
             const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
             
-            // First check mailto links (most reliable)
-            document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
-                if (link.href) {
-                    const email = link.href.replace('mailto:', '').split('?')[0];
-                    if (email) results.add(email.toLowerCase());
-                }
-            });
-
-            // Then check page content
-            const content = document.body.innerText;
-            const matches = content.match(emailRegex) || [];
+            // Get all text content
+            const textContent = document.body.innerText;
+            const matches = textContent.match(emailRegex) || [];
+            
             matches.forEach(email => {
                 email = email.toLowerCase().trim();
                 if (email.length > 5 && 
                     email.length < 100 && 
                     !email.includes('example') &&
-                    !email.includes('test@') &&
-                    !email.includes('email@')) {
+                    !email.includes('test@')) {
                     results.add(email);
                 }
+            });
+
+            // Check mailto links
+            document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
+                const email = link.href.replace('mailto:', '').split('?')[0];
+                if (email) results.add(email.toLowerCase());
             });
 
             return Array.from(results);
@@ -84,8 +73,6 @@ async function extractEmailsFromPage(page) {
 
 async function safeGoTo(page, url) {
     try {
-        if (!page || page.isClosed()) return false;
-
         url = url.trim();
         if (!url.startsWith('http')) {
             url = 'https://' + url;
@@ -96,7 +83,6 @@ async function safeGoTo(page, url) {
             waitUntil: 'domcontentloaded'
         });
         
-        await page.waitForTimeout(1500);
         return true;
     } catch (error) {
         console.error(`Navigation error for ${url}:`, error.message);
@@ -128,11 +114,12 @@ parentPort.on('message', async (data) => {
         // Try main page
         if (await safeGoTo(page, business.website)) {
             email = await extractEmailsFromPage(page);
+            console.log(`Found email on main page: ${email}`);
         }
 
         // Try contact page if no email found
-        if (!email && !page.isClosed()) {
-            const contactPaths = ['contact', 'contact-us', 'about'];
+        if (!email) {
+            const contactPaths = ['contact', 'contact-us'];
             
             for (const path of contactPaths) {
                 if (email) break;
@@ -140,6 +127,7 @@ parentPort.on('message', async (data) => {
                 const contactUrl = `${business.website.replace(/\/+$/, '')}/${path}`;
                 if (await safeGoTo(page, contactUrl)) {
                     email = await extractEmailsFromPage(page);
+                    if (email) console.log(`Found email on contact page: ${email}`);
                 }
             }
         }
@@ -151,8 +139,10 @@ parentPort.on('message', async (data) => {
         parentPort.postMessage({ requestId: data?.requestId, error: true, email: 'N/A' });
     } finally {
         try {
-            if (page && !page.isClosed()) await page.close().catch(() => {});
+            if (page) await page.close().catch(() => {});
             if (context) await context.close().catch(() => {});
+            if (browser) await browser.close().catch(() => {});
+            browser = null;
         } catch (error) {
             console.error('Cleanup error:', error);
         }
@@ -160,19 +150,17 @@ parentPort.on('message', async (data) => {
 });
 
 // Clean up browser on exit
-process.on('exit', async () => {
+process.on('exit', async () => { 
     if (browser) {
-        await browser.close().catch(() => {});
+        await browser.close().catch(() => {}); 
         browser = null;
     }
 });
 
 // Handle worker termination
 process.on('SIGTERM', async () => {
-    try {
-        if (browser) await browser.close().catch(() => {});
+    if (browser) {
+        await browser.close().catch(() => {});
         browser = null;
-    } catch (error) {
-        console.error('SIGTERM cleanup error:', error);
     }
 });  

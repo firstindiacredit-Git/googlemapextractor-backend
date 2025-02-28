@@ -11,10 +11,15 @@ let currentWorkerIndex = 0;
 
 // Initialize worker pool
 function initializeWorkerPool() {
+    // Clean up existing workers first
+    cleanupWorkers();
+    
+    // Create new workers
     for (let i = 0; i < NUM_WORKERS; i++) {
         const worker = new Worker(path.join(__dirname, 'worker.js'));
         workers.push(worker);
     }
+    currentWorkerIndex = 0;
 }
 
 // Get next available worker using round-robin
@@ -124,10 +129,8 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
     const MAX_CONCURRENT = extractEmail ? 2 : 4; // Adjust concurrent operations
 
     try {
-        // Initialize worker pool if not already initialized
-        if (workers.length === 0) {
-            initializeWorkerPool();
-        }
+        // Initialize new worker pool for each scraping session
+        initializeWorkerPool();
 
         browser = await chromium.launch({ 
             headless: true,
@@ -158,6 +161,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
         // Optimize batch processing
         async function processListingsBatch(listings) {
             const results = [];
+            const processedUrls = new Set(); // Track processed URLs to avoid duplicates
             const batchSize = Math.min(MAX_CONCURRENT, listings.length);
             
             for (let i = 0; i < listings.length; i += batchSize) {
@@ -167,44 +171,47 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                 const batchPromises = batch.map(async (listing) => {
                     try {
                         const detailsPage = await context.newPage();
-                        await detailsPage.setDefaultNavigationTimeout(20000); // Increased timeout
+                        await detailsPage.setDefaultNavigationTimeout(20000);
 
                         const href = await listing.getAttribute('href');
+                        
+                        // Skip if already processed this URL
+                        if (processedUrls.has(href)) {
+                            await detailsPage.close();
+                            return null;
+                        }
+                        processedUrls.add(href);
+
                         await detailsPage.goto(href, { waitUntil: 'domcontentloaded' });
 
-                        // Get the phone number element
-                        const phoneElement = await detailsPage.$('button[data-item-id^="phone:tel:"] div');
-                        let phone = 'N/A';
-                        let countryCode = 'N/A';
-
-                        if (phoneElement) {
-                            phone = await phoneElement.textContent().catch(() => 'N/A');
-                            // Ensure phone is not truncated
-                            // console.log(`Extracted phone number: ${phone}`);
-                            // Extract country code from phone number
-                            const phoneMatch = phone.match(/\+(\d+)/);
-                            if (phoneMatch) {
-                                countryCode = `+${phoneMatch[1]}`;
-                                phone = phone.replace(countryCode, '').trim();
-                            } else if (phone.startsWith('0')) {
-                                countryCode = '+91'; // Default for India
-                                phone = phone.substring(1).trim();
-                            } else {
-                                countryCode = '+91'; // Default for India
-                            }
-                        }
-
+                        // Extract business data
                         const business = {
                             name: await listing.getAttribute('aria-label').catch(() => 'N/A'),
                             website: await detailsPage.$eval('a[data-item-id="authority"]', el => el.href).catch(() => 'N/A'),
-                            phone,
-                            countryCode,
+                            phone: 'N/A',
+                            countryCode: 'N/A',
                             address: await detailsPage.$eval('button[data-item-id="address"] div', el => el.textContent.trim()).catch(() => 'N/A'),
                             rating: await detailsPage.$eval('div.F7nice span[aria-hidden="true"]', el => el.textContent.trim()).catch(() => 'N/A'),
                             reviews: await detailsPage.$eval('div.F7nice span[aria-label*="reviews"]', el => el.getAttribute('aria-label').split(' ')[0]).catch(() => 'N/A'),
                             category: await detailsPage.$eval('button.DkEaL', el => el.textContent.trim()).catch(() => 'N/A'),
                             email: 'N/A'
                         };
+
+                        // Get phone number
+                        const phoneElement = await detailsPage.$('button[data-item-id^="phone:tel:"] div');
+                        if (phoneElement) {
+                            business.phone = await phoneElement.textContent().catch(() => 'N/A');
+                            const phoneMatch = business.phone.match(/\+(\d+)/);
+                            if (phoneMatch) {
+                                business.countryCode = `+${phoneMatch[1]}`;
+                                business.phone = business.phone.replace(business.countryCode, '').trim();
+                            } else if (business.phone.startsWith('0')) {
+                                business.countryCode = '+91';
+                                business.phone = business.phone.substring(1).trim();
+                            } else {
+                                business.countryCode = '+91';
+                            }
+                        }
 
                         // Process address parts
                         const addressParts = business.address.split(',');
@@ -216,6 +223,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                             business.state = pinMatch ? statePin.replace(pinMatch[0], '').trim() : statePin;
                         }
 
+                        // Extract email if needed
                         if (extractEmail && business.website !== 'N/A') {
                             try {
                                 const worker = getNextWorker();
@@ -225,7 +233,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                                     const timeoutId = setTimeout(() => {
                                         worker.removeListener('message', messageHandler);
                                         resolve({ error: false, email: 'N/A' });
-                                    }, 15000); // Reduced timeout to 15 seconds
+                                    }, 30000);
 
                                     const messageHandler = (data) => {
                                         if (data.requestId === requestId) {
@@ -240,7 +248,6 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                                 });
 
                                 business.email = result.error ? 'N/A' : (result.email || 'N/A');
-                                // console.log(`Found email for ${business.name}: ${business.email}`);
                             } catch (error) {
                                 console.error(`Error extracting email for ${business.name}:`, error);
                                 business.email = 'N/A';
@@ -257,11 +264,6 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
 
                 const batchResults = await Promise.all(batchPromises);
                 results.push(...batchResults.filter(r => r !== null));
-                
-                // Add small delay between batches to prevent rate limiting
-                if (!isStopped && i + batchSize < listings.length) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
             }
             return results;
         }
@@ -314,19 +316,23 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
         console.error('Scraping error:', error);
         return scrapedData;
     } finally {
-        // Cleanup
-        for (const worker of workers) {
-            worker.terminate();
-        }
+        // Clean up resources
+        cleanupWorkers();
         if (browser) {
-            await browser.close(); 
+            await browser.close().catch(() => {});
         }
     }
 }
 
 // Cleanup function to terminate workers
 function cleanupWorkers() {
-    workers.forEach(worker => worker.terminate());
+    workers.forEach(worker => {
+        try {
+            worker.terminate();
+        } catch (error) {
+            console.error('Error terminating worker:', error);
+        }
+    });
     workers.length = 0;
 }
 
