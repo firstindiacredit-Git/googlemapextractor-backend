@@ -8,7 +8,7 @@ const path = require('path');
 let currentScraping = null; // Track current scraping process 
 
 const app = express();
-app.use(cors());
+app.use(cors()); 
 app.use(express.json()); 
 app.get("/hello", (req, res) => { res.send("Hello World"); });
 
@@ -27,6 +27,9 @@ app.post('/stop-scrape', (req, res) => {
 app.post('/scrape', async (req, res) => {
     const { query, location, isPincode, total, extractEmail } = req.body;
     
+    // Remove gzip compression as it can interfere with streaming
+    // res.setHeader('Content-Encoding', 'gzip');
+    
     currentScraping = new AbortController();
     let dataCount = 0;
 
@@ -34,41 +37,28 @@ app.post('/scrape', async (req, res) => {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Transfer-Encoding', 'chunked');
         
-        // Construct search query based on whether location is a pincode
         const searchQuery = isPincode 
-            ? `${query} ${location}`  // Use pincode directly
-            : `${query} ${location}`; // Use as regular location
+            ? `${query} ${location}`
+            : `${query} ${location}`;
 
-        const results = await scrapeGoogleMaps(
+        await scrapeGoogleMaps(
             searchQuery,
             total,
             (data) => {
-                // Filter results if searching by pincode
-                if (isPincode) {
-                    if (data.pincode === location.trim()) {
-                        dataCount++;
-                        const progress = Math.min((dataCount / total) * 100, 100);
-                        
-                        if (!res.writableEnded) {
-                            res.write(JSON.stringify({ 
-                                type: 'update', 
-                                data: data,
-                                progress: progress
-                            }) + '\n');
-                        }
-                    }
-                } else {
-                    // Normal processing for non-pincode searches
-                    dataCount++;
-                    const progress = Math.min((dataCount / total) * 100, 100);
-                    
-                    if (!res.writableEnded) {
-                        res.write(JSON.stringify({ 
-                            type: 'update', 
-                            data: data,
-                            progress: progress
-                        }) + '\n');
-                    }
+                if (isPincode && data.pincode !== location.trim()) {
+                    return;
+                }
+
+                dataCount++;
+                const progress = Math.min((dataCount / total) * 100, 100);
+                
+                // Send data immediately without buffering
+                if (!res.writableEnded) {
+                    res.write(JSON.stringify({ 
+                        type: 'update', 
+                        data: data,
+                        progress: progress
+                    }) + '\n');
                 }
             },
             currentScraping.signal,
@@ -82,8 +72,8 @@ app.post('/scrape', async (req, res) => {
             }));
             res.end();
         }
-        
     } catch (error) {
+        cleanupWorkers();
         currentScraping = null;
         if (!res.headersSent) {
             console.error('Scraping failed:', error);
@@ -146,4 +136,4 @@ app.use(express.static(path.join(__dirname, 'dist')));
 app.get('*', (req, res) => { res.sendFile(path.join(__dirname, 'dist', 'index.html')); });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));  

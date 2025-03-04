@@ -34,32 +34,33 @@ async function initBrowser() {
 
 async function extractEmailsFromPage(page) {
     try {
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForTimeout(2000);
+        await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+        await page.waitForTimeout(500);
 
         const emails = await page.evaluate(() => {
             const results = new Set();
-            const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
+            const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
             
-            // Get all text content
             const textContent = document.body.innerText;
             const matches = textContent.match(emailRegex) || [];
             
-            matches.forEach(email => {
-                email = email.toLowerCase().trim();
-                if (email.length > 5 && 
-                    email.length < 100 && 
-                    !email.includes('example') &&
-                    !email.includes('test@')) {
-                    results.add(email);
+            if (matches.length === 0) {
+                document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
+                    const email = link.href.replace('mailto:', '').split('?')[0].toLowerCase();
+                    if (email) results.add(email);
+                });
+            } else {
+                for (const email of matches) {
+                    if (email.length > 5 && 
+                        email.length < 100 && 
+                        !email.includes('example') &&
+                        !email.includes('test@') &&
+                        !email.includes('email@')) {
+                        results.add(email.toLowerCase().trim());
+                        break;
+                    }
                 }
-            });
-
-            // Check mailto links
-            document.querySelectorAll('a[href^="mailto:"]').forEach(link => {
-                const email = link.href.replace('mailto:', '').split('?')[0];
-                if (email) results.add(email.toLowerCase());
-            });
+            }
 
             return Array.from(results);
         });
@@ -78,14 +79,18 @@ async function safeGoTo(page, url) {
             url = 'https://' + url;
         }
 
-        await page.goto(url, {
-            timeout: 15000,
-            waitUntil: 'domcontentloaded'
-        });
+        await Promise.race([
+            page.goto(url, {
+                timeout: 5000,
+                waitUntil: 'domcontentloaded'
+            }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout')), 5000)
+            )
+        ]);
         
         return true;
     } catch (error) {
-        console.error(`Navigation error for ${url}:`, error.message);
         return false;
     }
 }
@@ -111,15 +116,12 @@ parentPort.on('message', async (data) => {
         ({ page, context } = result);
         let email = null;
 
-        // Try main page
         if (await safeGoTo(page, business.website)) {
             email = await extractEmailsFromPage(page);
-            console.log(`Found email on main page: ${email}`);
         }
 
-        // Try contact page if no email found
         if (!email) {
-            const contactPaths = ['contact', 'contact-us'];
+            const contactPaths = ['contact', 'contact-us', 'about'];
             
             for (const path of contactPaths) {
                 if (email) break;
@@ -127,7 +129,7 @@ parentPort.on('message', async (data) => {
                 const contactUrl = `${business.website.replace(/\/+$/, '')}/${path}`;
                 if (await safeGoTo(page, contactUrl)) {
                     email = await extractEmailsFromPage(page);
-                    if (email) console.log(`Found email on contact page: ${email}`);
+                    if (email) break;
                 }
             }
         }
@@ -135,7 +137,6 @@ parentPort.on('message', async (data) => {
         parentPort.postMessage({ requestId, error: false, email: email || 'N/A' });
 
     } catch (error) {
-        console.error('Worker error:', error);
         parentPort.postMessage({ requestId: data?.requestId, error: true, email: 'N/A' });
     } finally {
         try {

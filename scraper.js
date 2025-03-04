@@ -3,15 +3,16 @@ const { Worker } = require('worker_threads');
 const path = require('path');
 const os = require('os');
 
-// Use 2 worker threads for better resource management
-const NUM_WORKERS = 2;
-// console.log(`Using ${NUM_WORKERS} worker threads`);
-const workers = [];
+// Update worker pool management
+const NUM_WORKERS = 4;
+let workers = [];
 let currentWorkerIndex = 0;
 
-// Initialize worker pool
+// Add this at the top of the file
+const processedUrls = new Set(); // Track all processed URLs globally
+
 function initializeWorkerPool() {
-    // Clean up existing workers first
+    // Clean up existing workers
     cleanupWorkers();
     
     // Create new workers
@@ -22,8 +23,10 @@ function initializeWorkerPool() {
     currentWorkerIndex = 0;
 }
 
-// Get next available worker using round-robin
 function getNextWorker() {
+    if (workers.length === 0) {
+        initializeWorkerPool();
+    }
     const worker = workers[currentWorkerIndex];
     currentWorkerIndex = (currentWorkerIndex + 1) % workers.length;
     return worker;
@@ -46,18 +49,18 @@ async function extractEmailsFromWebsite(page, url) {
         // console.log(`Cleaned URL: ${url}`);
 
         try {
-             console.log('Navigating to website...');
+            console.log('Navigating to website...');
             await page.goto(url, { 
                 timeout: 60000,
                 waitUntil: 'domcontentloaded'
             });
-             console.log('Successfully loaded website');
+            console.log('Successfully loaded website');
 
             const emails = await extractEmailsFromPage(page);
             // console.log(`Found ${emails.length} potential emails`);  
             
             if (emails.length > 0) {
-                 console.log(`Emails found: ${emails.join(', ')}`);
+                console.log(`Emails found: ${emails.join(', ')}`);
                 return emails[0];
             }
             
@@ -122,7 +125,137 @@ async function extractEmailsFromPage(page) {
     return emails;
 }
 
-async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extractEmail = false) {
+// Update the batch size and concurrent operations
+const MAX_CONCURRENT_WITH_EMAIL = 4;
+const MAX_CONCURRENT_WITHOUT_EMAIL = 8;  // Increased for faster scraping
+const MAX_RETRIES = 2;
+
+async function processListingsBatch(listings) {
+    const results = [];
+    const batchSize = Math.min(extractEmail ? MAX_CONCURRENT_WITH_EMAIL : MAX_CONCURRENT_WITHOUT_EMAIL, listings.length);
+    
+    for (let i = 0; i < listings.length; i += batchSize) {
+        if (isStopped) break;
+        
+        const batch = listings.slice(i, i + batchSize);
+        const batchPromises = batch.map(async (listing) => {
+            try {
+                const detailsPage = await context.newPage();
+                await detailsPage.setDefaultNavigationTimeout(15000);
+
+                const href = await listing.getAttribute('href');
+                const name = await listing.getAttribute('aria-label').catch(() => 'N/A');
+                
+                // Skip duplicates
+                const key = `${href}-${name}`;
+                if (processedUrls.has(key)) {
+                    await detailsPage.close();
+                    return null;
+                }
+                processedUrls.add(key);
+
+                // Fast navigation
+                await detailsPage.goto(href, { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: extractEmail ? 10000 : 5000 
+                });
+
+                // Extract basic data first
+                const [website, address, rating, reviews, category] = await Promise.all([
+                    detailsPage.$eval('a[data-item-id="authority"]', el => el.href).catch(() => 'N/A'),
+                    detailsPage.$eval('button[data-item-id="address"] div', el => el.textContent.trim()).catch(() => 'N/A'),
+                    detailsPage.$eval('div.F7nice span[aria-hidden="true"]', el => el.textContent.trim()).catch(() => 'N/A'),
+                    detailsPage.$eval('div.F7nice span[aria-label*="reviews"]', el => el.getAttribute('aria-label').split(' ')[0]).catch(() => 'N/A'),
+                    detailsPage.$eval('button.DkEaL', el => el.textContent.trim()).catch(() => 'N/A')
+                ]);
+
+                const business = { name, website, address, rating, reviews, category, phone: 'N/A', countryCode: 'N/A', email: 'N/A' };
+
+                // Extract phone in parallel with other operations
+                const phoneElement = await detailsPage.$('button[data-item-id^="phone:tel:"] div');
+                if (phoneElement) {
+                    business.phone = await phoneElement.textContent();
+                    const phoneMatch = business.phone.match(/\+(\d+)/);
+                    if (phoneMatch) {
+                        business.countryCode = `+${phoneMatch[1]}`;
+                        business.phone = business.phone.replace(business.countryCode, '').trim();
+                    } else {
+                        business.countryCode = '+91';
+                        if (business.phone.startsWith('0')) {
+                            business.phone = business.phone.substring(1).trim();
+                        }
+                    }
+                }
+
+                // Process address parts
+                const addressParts = address.split(',');
+                if (addressParts.length >= 2) {
+                    business.city = addressParts[addressParts.length - 2].trim();
+                    const statePin = addressParts[addressParts.length - 1].trim();
+                    const pinMatch = statePin.match(/\d{6}/);
+                    business.pincode = pinMatch ? pinMatch[0] : 'N/A';
+                    business.state = pinMatch ? statePin.replace(pinMatch[0], '').trim() : statePin;
+                }
+
+                // Extract email only if needed
+                if (extractEmail && website !== 'N/A') {
+                    try {
+                        const worker = getNextWorker();
+                        if (!worker) {
+                            business.email = 'N/A';
+                        } else {
+                            const requestId = Date.now() + '-' + Math.random();
+                            
+                            const result = await new Promise((resolve) => {
+                                const timeoutId = setTimeout(() => {
+                                    try {
+                                        worker.removeListener('message', messageHandler);
+                                    } catch (err) {}
+                                    resolve({ error: false, email: 'N/A' });
+                                }, 15000);
+
+                                const messageHandler = (data) => {
+                                    if (data.requestId === requestId) {
+                                        clearTimeout(timeoutId);
+                                        try {
+                                            worker.removeListener('message', messageHandler);
+                                        } catch (err) {}
+                                        resolve(data);
+                                    }
+                                };
+
+                                try {
+                                    worker.on('message', messageHandler);
+                                    worker.postMessage({ business, requestId });
+                                } catch (err) {
+                                    clearTimeout(timeoutId);
+                                    resolve({ error: false, email: 'N/A' });
+                                }
+                            });
+
+                            business.email = result.error ? 'N/A' : (result.email || 'N/A');
+                        }
+                    } catch (error) {
+                        console.error(`Error extracting email for ${business.name}:`, error);
+                        business.email = 'N/A';
+                    }
+                }
+
+                await detailsPage.close();
+                return business;
+            } catch (error) {
+                return null;
+            }
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults.filter(r => r !== null));
+    }
+    return results;
+}
+
+async function scrapeGoogleMaps(query, total = Infinity, onDataScraped, signal, extractEmail = false) {
+    processedUrls.clear(); // Clear processed URLs at start of new scrape
     let browser = null;
     let scrapedData = [];
     let isStopped = false;
@@ -130,7 +263,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
 
     try {
         // Initialize new worker pool for each scraping session
-        initializeWorkerPool();
+            initializeWorkerPool();
 
         browser = await chromium.launch({ 
             headless: true,
@@ -161,7 +294,6 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
         // Optimize batch processing
         async function processListingsBatch(listings) {
             const results = [];
-            const processedUrls = new Set(); // Track processed URLs to avoid duplicates
             const batchSize = Math.min(MAX_CONCURRENT, listings.length);
             
             for (let i = 0; i < listings.length; i += batchSize) {
@@ -174,19 +306,21 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                         await detailsPage.setDefaultNavigationTimeout(20000);
 
                         const href = await listing.getAttribute('href');
+                        const name = await listing.getAttribute('aria-label').catch(() => 'N/A');
                         
-                        // Skip if already processed this URL
-                        if (processedUrls.has(href)) {
+                        // Skip if already processed this URL or business name
+                        const key = `${href}-${name}`;
+                        if (processedUrls.has(key)) {
                             await detailsPage.close();
                             return null;
                         }
-                        processedUrls.add(href);
+                        processedUrls.add(key);
 
                         await detailsPage.goto(href, { waitUntil: 'domcontentloaded' });
 
                         // Extract business data
                         const business = {
-                            name: await listing.getAttribute('aria-label').catch(() => 'N/A'),
+                            name: name,
                             website: await detailsPage.$eval('a[data-item-id="authority"]', el => el.href).catch(() => 'N/A'),
                             phone: 'N/A',
                             countryCode: 'N/A',
@@ -196,6 +330,18 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                             category: await detailsPage.$eval('button.DkEaL', el => el.textContent.trim()).catch(() => 'N/A'),
                             email: 'N/A'
                         };
+
+                        // Check for duplicate based on multiple fields
+                        const isDuplicate = results.some(existingBusiness => 
+                            existingBusiness.name === business.name &&
+                            existingBusiness.address === business.address &&
+                            existingBusiness.phone === business.phone
+                        );
+
+                        if (isDuplicate) {
+                            await detailsPage.close();
+                            return null;
+                        }
 
                         // Get phone number
                         const phoneElement = await detailsPage.$('button[data-item-id^="phone:tel:"] div');
@@ -227,27 +373,40 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                         if (extractEmail && business.website !== 'N/A') {
                             try {
                                 const worker = getNextWorker();
-                                const requestId = Date.now() + '-' + Math.random();
-                                
-                                const result = await new Promise((resolve, reject) => {
-                                    const timeoutId = setTimeout(() => {
-                                        worker.removeListener('message', messageHandler);
-                                        resolve({ error: false, email: 'N/A' });
-                                    }, 30000);
+                                if (!worker) {
+                                    business.email = 'N/A';
+                                } else {
+                                    const requestId = Date.now() + '-' + Math.random();
+                                    
+                                    const result = await new Promise((resolve) => {
+                                        const timeoutId = setTimeout(() => {
+                                            try {
+                                                worker.removeListener('message', messageHandler);
+                                            } catch (err) {}
+                                            resolve({ error: false, email: 'N/A' });
+                                        }, 15000);
 
-                                    const messageHandler = (data) => {
-                                        if (data.requestId === requestId) {
+                                        const messageHandler = (data) => {
+                                            if (data.requestId === requestId) {
+                                                clearTimeout(timeoutId);
+                                                try {
+                                                    worker.removeListener('message', messageHandler);
+                                                } catch (err) {}
+                                                resolve(data);
+                                            }
+                                        };
+
+                                        try {
+                                            worker.on('message', messageHandler);
+                                            worker.postMessage({ business, requestId });
+                                        } catch (err) {
                                             clearTimeout(timeoutId);
-                                            worker.removeListener('message', messageHandler);
-                                            resolve(data);
+                                            resolve({ error: false, email: 'N/A' });
                                         }
-                                    };
+                                    });
 
-                                    worker.on('message', messageHandler);
-                                    worker.postMessage({ business, requestId });
-                                });
-
-                                business.email = result.error ? 'N/A' : (result.email || 'N/A');
+                                    business.email = result.error ? 'N/A' : (result.email || 'N/A');
+                                }
                             } catch (error) {
                                 console.error(`Error extracting email for ${business.name}:`, error);
                                 business.email = 'N/A';
@@ -268,7 +427,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
             return results;
         }
 
-        while (!isStopped && scrapedData.length < total && scrollAttempts < 100) {
+        while (!isStopped && scrollAttempts < 500) {
             try {
                 await page.evaluate(() => {
                     const feed = document.querySelector('div[role="feed"]'); 
@@ -280,7 +439,7 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                 await page.waitForTimeout(2000);
 
                 const listings = await page.$$('a[href*="https://www.google.com/maps/place"]');
-                 console.log(`Found ${listings.length} total listings (${lastResultsCount} previous)`);
+                console.log(`Found ${listings.length} total listings (${lastResultsCount} previous)`);
 
                 if (listings.length > lastResultsCount) {
                     const newListings = listings.slice(lastResultsCount);
@@ -289,16 +448,21 @@ async function scrapeGoogleMaps(query, total = 100, onDataScraped, signal, extra
                     for (const result of results) {
                         scrapedData.push(result);
                         onDataScraped(result);
-                         console.log(`✅ Scraped (${scrapedData.length}/${total}): ${result.name}`);
+                        console.log(`✅ Scraped (${scrapedData.length}): ${result.name}`);
                     }
 
                     lastResultsCount = listings.length; 
                     consecutiveNoNewResults = 0;
                 } else {
                     consecutiveNoNewResults++;
-                    if (consecutiveNoNewResults >= 5) {
+                    if (consecutiveNoNewResults >= 4) {
+                        // Try clicking "Show more" button
                         await page.click('button[aria-label="Show more"]').catch(() => {});
-                        if (consecutiveNoNewResults >= 8) break;
+                        // Break after 4 attempts with no new results
+                        if (consecutiveNoNewResults >= 4) {
+                            console.log('No more results found after 4 attempts');
+                            break;
+                        }
                     }
                 }
 
